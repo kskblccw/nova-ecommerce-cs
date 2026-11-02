@@ -1,0 +1,14 @@
+{
+  "label": "numpy(246 chunks)",
+  "backend": "JSONB + numpy 余弦（配置 auto，向量 0/246）",
+  "chunks": 246,
+  "requests": 300,
+  "concurrency": 8,
+  "elapsed_seconds": 40.09,
+  "qps": 7.5,
+  "p50_ms": 902.52,
+  "p95_ms": 1038.32,
+  "p99_ms": 1600.54,
+  "avg_ms": 918.82,
+  "max_ms": 1661.26
+}

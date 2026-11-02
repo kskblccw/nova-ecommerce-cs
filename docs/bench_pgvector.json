@@ -1,0 +1,14 @@
+{
+  "label": "pgvector(246 chunks)",
+  "backend": "pgvector + HNSW（配置 auto，向量 246/246）",
+  "chunks": 246,
+  "requests": 300,
+  "concurrency": 8,
+  "elapsed_seconds": 2.25,
+  "qps": 133.4,
+  "p50_ms": 44.26,
+  "p95_ms": 61.82,
+  "p99_ms": 211.26,
+  "avg_ms": 49.05,
+  "max_ms": 256.0
+}
