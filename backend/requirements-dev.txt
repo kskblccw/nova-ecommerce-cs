@@ -1,0 +1,7 @@
+# 开发/测试依赖：在运行时依赖之上追加，CI 与本地测试统一使用本文件。
+-r requirements.txt
+pytest==9.2.0
+pytest-asyncio==1.4.1
+pytest-cov==7.0.0
+ruff==0.17.3
+mypy==2.4.1

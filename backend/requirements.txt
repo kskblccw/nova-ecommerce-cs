@@ -1,0 +1,23 @@
+# 运行时依赖：全部锁定到已验证版本，避免上游漂移导致构建/运行行为变化。
+# 升级流程：改版本 -> alembic upgrade head -> pytest -> 前端冒烟 -> 更新本文件。
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+sqlalchemy[asyncio]==2.1.6
+asyncpg==0.32.0
+alembic==1.20.1
+pydantic==2.14.2
+pydantic-settings==2.16.2
+langgraph==1.2.19
+langgraph-checkpoint-postgres==3.2.0
+langchain==1.4.7
+langchain-core==1.7.3
+langchain-openai==1.7.3
+langsmith==0.14.16
+httpx==0.28.1
+PyJWT==2.15.1
+bcrypt==5.0.0
+python-dotenv==1.2.4
+structlog==26.1.0
+numpy==2.5.4
+psycopg[binary,pool]==3.3.6
+redis==8.1.0
