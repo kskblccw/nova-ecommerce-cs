@@ -418,6 +418,11 @@
     }
     busy = true;
     sendEl.disabled = true;
+    if (key === "cancel") {
+      ORDERS[0].status = "待付款";
+      ORDERS[0].cls = "pending";
+      ORDERS[0].extra = "下单后 30 分钟内支付";
+    }
     addBubble("user", scenario.user);
     inputEl.value = "";
     statusEl.innerHTML = '<span class="pulse">●</span> ' + scenario.status;
