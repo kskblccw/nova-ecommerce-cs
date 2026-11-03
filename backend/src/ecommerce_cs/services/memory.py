@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -69,15 +70,45 @@ def _format_history(messages: Sequence[Any], limit: int = 20) -> str:
 
 async def refresh_memory(conversation_id: str, user_id: int) -> None:
     """后台任务：压缩摘要并更新画像，失败不影响主流程。"""
-    lock = _refresh_locks.setdefault(conversation_id, asyncio.Lock())
+    lock = refresh_lock(conversation_id)
     if lock.locked():
         return
     async with lock:
         await _refresh_memory(conversation_id, user_id)
 
 
-_refresh_locks: dict[str, asyncio.Lock] = {}
+_REFRESH_LOCK_TTL_SECONDS = 600.0
+_MAX_REFRESH_LOCKS = 2048
+
+_refresh_locks: dict[str, tuple[asyncio.Lock, float]] = {}
 _background_tasks: set[asyncio.Task] = set()
+
+
+def _prune_refresh_locks(now: float) -> None:
+    """只回收空闲超过 TTL 的锁；正在持有的锁永远不会被淘汰。"""
+    stale = [
+        key
+        for key, (lock, seen) in _refresh_locks.items()
+        if not lock.locked() and now - seen > _REFRESH_LOCK_TTL_SECONDS
+    ]
+    for key in stale:
+        _refresh_locks.pop(key, None)
+
+
+def refresh_lock(conversation_id: str) -> asyncio.Lock:
+    """按会话串行化记忆刷新，空闲锁可回收，字典另有容量上限兜底。"""
+    now = time.monotonic()
+    entry = _refresh_locks.get(conversation_id)
+    if entry is not None:
+        lock, _seen = entry
+        if lock.locked() or now - _seen <= _REFRESH_LOCK_TTL_SECONDS:
+            _refresh_locks[conversation_id] = (lock, now)
+            return lock
+    if len(_refresh_locks) >= _MAX_REFRESH_LOCKS:
+        _prune_refresh_locks(now)
+    lock = asyncio.Lock()
+    _refresh_locks[conversation_id] = (lock, now)
+    return lock
 
 
 def schedule_refresh(conversation_id: str, user_id: int) -> None:

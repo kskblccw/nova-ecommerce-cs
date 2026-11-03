@@ -1,6 +1,9 @@
 """客服主图：确定性预路由 → 单次分类 → 域 Agent → 结果整理 → 审批。"""
 
+import asyncio
 import json
+import re
+import uuid
 from collections.abc import Hashable
 from typing import Any
 
@@ -28,9 +31,9 @@ from ecommerce_cs.agents.prompts import (
 from ecommerce_cs.agents.routing import classify, pre_route
 from ecommerce_cs.agents.state import CSRState
 from ecommerce_cs.agents.tools.aftersale import AFTERSALE_TOOLS
-from ecommerce_cs.agents.tools.catalog import PRODUCT_TOOLS
+from ecommerce_cs.agents.tools.catalog import PRODUCT_TOOLS, compare_products, search_products
 from ecommerce_cs.agents.tools.faq import FAQ_TOOLS
-from ecommerce_cs.agents.tools.order import ORDER_TOOLS
+from ecommerce_cs.agents.tools.order import ORDER_TOOLS, cancel_order
 from ecommerce_cs.agents.tools.service import SERVICE_TOOLS, get_current_user
 from ecommerce_cs.core.logging import get_logger
 from ecommerce_cs.core.settings import get_settings
@@ -104,6 +107,185 @@ def _parse_tool_payload(message: BaseMessage) -> dict | None:
     if isinstance(body, dict) and body.get("kind"):
         return body
     return None
+
+
+_CANCEL_ORDER_NO_RE = re.compile(r"ORD[0-9A-Za-z]{6,}")
+_CANCEL_QUESTION_RE = re.compile(r"怎么取消|如何取消|取消流程|取消规则|能否取消|可以取消吗|取消政策")
+
+_COMPARE_RE = re.compile(r"对比|比较|哪个更?好|哪个更|有什么区别|区别|差在哪|vs", re.I)
+_COMPARE_SPLIT_RE = re.compile(r"\s*(?:和|与|、|，|,|vs\.?)\s*", re.I)
+_COMPARE_NOISE_RE = re.compile(
+    r"帮我|请|麻烦|一下|看看|对比一下|对比|比较一下|比较|哪个好|哪个更|"
+    r"有什么区别|区别|差在哪|推荐|[?？。!！]"
+)
+
+
+async def _prefetch_cancel_tool(state: CSRState) -> list[BaseMessage]:
+    """用户直接要求取消时先确定性生成待确认操作，避免模型只解释不调工具。
+
+    仅在“取消 + 明确订单号 + 非询问流程”时触发；状态不允许取消时返回空，
+    交给 Agent 正常解释，不替模型下结论。
+    """
+    if state.get("intent") != "order" or state.get("pending_action"):
+        return []
+    human = _last_human_message(state.get("messages", []))
+    if human is None:
+        return []
+    text = str(human.content)
+    if "取消" not in text or _CANCEL_QUESTION_RE.search(text):
+        return []
+    match = _CANCEL_ORDER_NO_RE.search(text)
+    if not match:
+        return []
+
+    coroutine = getattr(cancel_order, "coroutine", None)
+    if coroutine is None:
+        return []
+
+    order_no = match.group(0)
+    try:
+        summary, artifact = await asyncio.wait_for(
+            coroutine(order_no=order_no),
+            timeout=get_settings().tool_timeout_seconds,
+        )
+    except Exception:
+        log.exception("cancel_prefetch_failed", order_no=order_no)
+        return []
+
+    if not isinstance(artifact, dict) or artifact.get("kind") != "pending_action":
+        return []
+    action = (artifact.get("data") or {}).get("action")
+    if not isinstance(action, dict):
+        return []
+
+    call_id = f"prefetch-cancel-{uuid.uuid4().hex[:8]}"
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "cancel_order",
+                    "args": {"order_no": order_no},
+                    "id": call_id,
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content=summary,
+            artifact=artifact,
+            tool_call_id=call_id,
+            name="cancel_order",
+        ),
+    ]
+
+
+def _compare_candidates(text: str) -> list[str]:
+    """把“A 和 B 对比一下”拆成两个候选商品名，并去掉口语噪声。"""
+    candidates = []
+    for raw in _COMPARE_SPLIT_RE.split(text):
+        name = _COMPARE_NOISE_RE.sub("", raw).strip()
+        if len(name) >= 2:
+            candidates.append(name)
+    return candidates[:4]
+
+
+async def _resolve_compare_ids(names: list[str]) -> tuple[list[int], list[str]]:
+    """逐个商品名搜索并取最匹配的商品 ID，解析不足 2 个时返回空。"""
+    ids: list[int] = []
+    resolved: list[str] = []
+    timeout = get_settings().tool_timeout_seconds
+
+    for name in names:
+        coroutine = getattr(search_products, "coroutine", None)
+        if coroutine is None:
+            return [], []
+        try:
+            _, artifact = await asyncio.wait_for(
+                coroutine(keyword=name), timeout=timeout
+            )
+        except Exception:
+            log.exception("compare_prefetch_search_failed", keyword=name)
+            continue
+        items = ((artifact.get("data") or {}).get("products") or []) if isinstance(
+            artifact, dict
+        ) else []
+        if not items:
+            continue
+        matched = next((item for item in items if item.get("name") == name), None)
+        if matched is None:
+            matched = next(
+                (
+                    item
+                    for item in items
+                    if name in str(item.get("name", ""))
+                    or str(item.get("name", "")) in name
+                ),
+                None,
+            )
+        if matched is None:
+            matched = items[0]
+        product_id = int(matched.get("id") or 0)
+        if product_id and product_id not in ids:
+            ids.append(product_id)
+            resolved.append(str(matched.get("name", name)))
+    if len(ids) < 2:
+        return [], []
+    return ids, resolved
+
+
+async def _prefetch_compare_tool(state: CSRState) -> list[BaseMessage]:
+    """对比类问题先确定性解析商品并调用 compare_products，避免模型只搜不比。"""
+    if state.get("intent") != "product" or state.get("pending_action"):
+        return []
+    human = _last_human_message(state.get("messages", []))
+    if human is None:
+        return []
+    text = str(human.content)
+    if not _COMPARE_RE.search(text):
+        return []
+    names = _compare_candidates(text)
+    if len(names) < 2:
+        return []
+
+    ids, _resolved = await _resolve_compare_ids(names)
+    if len(ids) < 2:
+        return []
+
+    coroutine = getattr(compare_products, "coroutine", None)
+    if coroutine is None:
+        return []
+    try:
+        summary, artifact = await asyncio.wait_for(
+            coroutine(product_ids=ids[:4]),
+            timeout=get_settings().tool_timeout_seconds,
+        )
+    except Exception:
+        log.exception("compare_prefetch_failed", product_ids=ids[:4])
+        return []
+    if not isinstance(artifact, dict) or artifact.get("kind") != "comparison":
+        return []
+
+    call_id = f"prefetch-compare-{uuid.uuid4().hex[:8]}"
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "compare_products",
+                    "args": {"product_ids": ids[:4]},
+                    "id": call_id,
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content=summary,
+            artifact=artifact,
+            tool_call_id=call_id,
+            name="compare_products",
+        ),
+    ]
 
 
 def pre_route_node(state: CSRState) -> dict:
@@ -236,7 +418,13 @@ def build_graph(checkpointer=None):
 
     def make_agent_node(name: str):
         async def node(state: CSRState, config) -> dict:
-            trimmed = recent_messages(state.get("messages", []))
+            history = recent_messages(state.get("messages", []))
+            preface: list[BaseMessage] = []
+            if name == "order":
+                preface = await _prefetch_cancel_tool(state)
+            elif name == "product":
+                preface = await _prefetch_compare_tool(state)
+            trimmed = [*history, *preface]
             context: dict[str, Any] = get_runtime().context or {}
             settings = get_settings()
             budget = new_budget()
@@ -270,7 +458,7 @@ def build_graph(checkpointer=None):
             finally:
                 reset_budget(token)
 
-            new_messages = result.get("messages", [])[len(trimmed) :]
+            new_messages = [*preface, *result.get("messages", [])[len(trimmed) :]]
             return {
                 "messages": new_messages,
                 "steps": int(state.get("steps", 0)) + 1,

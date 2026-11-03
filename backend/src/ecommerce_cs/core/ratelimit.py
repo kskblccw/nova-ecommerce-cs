@@ -331,6 +331,23 @@ class RateLimitService:
         self._failures.clear()
         self._slots.clear()
 
+    async def ping(self) -> bool:
+        """就绪探针：Redis 未配置或不可用时返回 False，不影响主流程。"""
+        client = await self._client()
+        if client is None:
+            return False
+        try:
+            return bool(
+                await asyncio.wait_for(
+                    client.ping(),
+                    timeout=get_settings().rate_limit_redis_timeout_seconds,
+                )
+            )
+        except Exception:
+            self._redis_down_until = time.monotonic() + _REDIS_RETRY_SECONDS
+            log.warning("rate_limit_redis_unhealthy")
+            return False
+
     async def close(self) -> None:
         if self._redis is not None:
             try:
