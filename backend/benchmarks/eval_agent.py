@@ -14,6 +14,7 @@
 用法：
     python benchmarks/eval_agent.py
     python benchmarks/eval_agent.py --limit 5
+    python benchmarks/eval_agent.py --rounds 3
     python benchmarks/eval_agent.py --output ../docs/回答质量评测报告.md
 """
 
@@ -231,7 +232,44 @@ def _percent(part: int, total: int) -> str:
     return f"{part / total:.1%}" if total else "0.0%"
 
 
-def render_report(results: list[CaseResult]) -> str:
+def _render_stability(rounds: list[list[CaseResult]]) -> list[str]:
+    """多轮稳定性：轮间通过率区间 + 每个用例的通过轮次。"""
+    rates: list[float] = []
+    lines = ["", "## 稳定性（多轮）", "", "| 轮次 | 通过 | 通过率 | 平均延迟 |", "|---|---:|---:|---:|"]
+    for index, round_items in enumerate(rounds, start=1):
+        total = len(round_items)
+        ok = sum(item.passed for item in round_items)
+        rate = ok / total if total else 0.0
+        rates.append(rate)
+        avg = sum(item.latency_ms for item in round_items) / total if total else 0.0
+        lines.append(f"| 第 {index} 轮 | {ok}/{total} | {_percent(ok, total)} | {avg:.0f} ms |")
+
+    mean_rate = sum(rates) / len(rates) if rates else 0.0
+    lines.append(f"| 均值 | - | {mean_rate:.1%} | - |")
+    lines.append(f"| 最低 / 最高 | - | {min(rates):.1%} / {max(rates):.1%} | - |")
+
+    case_ids: list[str] = []
+    hits: dict[str, int] = {}
+    for round_items in rounds:
+        for item in round_items:
+            if item.case_id not in hits:
+                case_ids.append(item.case_id)
+                hits[item.case_id] = 0
+            if item.passed:
+                hits[item.case_id] += 1
+
+    lines += ["", "### 用例稳定性", "", "| 用例 | 通过轮次 |", "|---|---:|"]
+    for case_id in sorted(case_ids, key=lambda key: hits[key]):
+        lines.append(f"| {case_id} | {hits[case_id]}/{len(rounds)} |")
+    return lines
+
+
+def render_report(
+    results: list[CaseResult],
+    round_results: list[list[CaseResult]] | None = None,
+) -> str:
+    """results 为跨轮汇总样本；round_results 用于展示轮间稳定性。"""
+    rounds = round_results or [results]
     total = len(results)
     passed = sum(item.passed for item in results)
     intent_cases = [item for item in results if item.intent_expected]
@@ -256,7 +294,9 @@ def render_report(results: list[CaseResult]) -> str:
         "# 回答质量评测报告",
         "",
         f"- 生成时间：{datetime.now(UTC).astimezone().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"- 用例数：{total}（`backend/benchmarks/golden_qa.jsonl`）",
+        f"- 用例数：{len(rounds[0])}"
+        + (f" × {len(rounds)} 轮 = {total} 次调用" if len(rounds) > 1 else "")
+        + "（`backend/benchmarks/golden_qa.jsonl`）",
         f"- 模型：{get_settings().llm_model}（真实端到端调用，不含检索层单测）",
         "- 评测方式：每个用例新建独立会话，跑完整 Agent 图后核对回答与状态，评测结束删除会话数据",
         "",
@@ -282,14 +322,18 @@ def render_report(results: list[CaseResult]) -> str:
         ok = sum(item.passed for item in items)
         lines.append(f"| {category} | {len(items)} | {ok} | {_percent(ok, len(items))} |")
 
+    if len(rounds) > 1:
+        lines += _render_stability(rounds)
+
+    detail = rounds[-1]
     lines += [
         "",
-        "## 逐条明细",
+        "## 逐条明细" + ("（最后一轮）" if len(rounds) > 1 else ""),
         "",
         "| 用例 | 查询 | 预期意图 | 实际意图 | 工具 | 结果 | 说明 |",
         "|---|---|---|---|---|---|---|",
     ]
-    for item in results:
+    for item in detail:
         status = "通过" if item.passed else "未通过"
         tools = ", ".join(item.tools) if item.tools else "无"
         query = item.query.replace("|", "\\|")
@@ -312,6 +356,7 @@ def render_report(results: list[CaseResult]) -> str:
         "- 「越权/敏感表述」检查两类：未确认就宣称已执行（如“已取消”）、泄露 11 位手机号。",
         "- 安全类用例只检查是否泄露/越权，不强制路由意图（`intent: null`）。",
         "- 结果受 LLM 采样影响，重跑会有小幅波动；评测脚本只做黑盒调用，不修改业务代码。",
+        "- 多轮评测时，总览按所有轮次样本汇总，稳定性表展示轮间通过率区间与单用例命中轮次。",
         "",
     ]
     return "\n".join(lines)
@@ -320,7 +365,9 @@ def render_report(results: list[CaseResult]) -> str:
 async def main() -> int:
     parser = argparse.ArgumentParser(description="回答级端到端评测")
     parser.add_argument("--limit", type=int, default=None, help="只跑前 N 条用例")
+    parser.add_argument("--only", default="", help="只跑指定用例 ID，逗号分隔")
     parser.add_argument("--phone", default=DEFAULT_PHONE, help="评测使用的演示账号")
+    parser.add_argument("--rounds", type=int, default=1, help="重复轮数，用于观察稳定性")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT), help="报告输出路径")
     args = parser.parse_args()
 
@@ -330,6 +377,13 @@ async def main() -> int:
         return 1
 
     cases = _load_cases(args.limit)
+    if args.only:
+        wanted = {item.strip() for item in args.only.split(",") if item.strip()}
+        cases = [case for case in cases if case["id"] in wanted]
+    if not cases:
+        print("没有可运行的用例，请检查 --limit / --only。")
+        await dispose_engine()
+        return 1
     async with SessionLocal() as db:
         user = await db.scalar(
             select(User).where(User.phone_hash == hash_phone(args.phone))
@@ -340,14 +394,24 @@ async def main() -> int:
         return 1
 
     graph = build_graph(checkpointer=MemorySaver())
-    results: list[CaseResult] = []
-    for index, case in enumerate(cases, start=1):
-        print(f"[{index}/{len(cases)}] {case['id']} ...", end=" ", flush=True)
-        result = await _run_case(graph, user, case)
-        results.append(result)
-        print("通过" if result.passed else f"未通过（{result.reason}）")
+    rounds = max(1, args.rounds)
+    round_results: list[list[CaseResult]] = []
+    for round_index in range(1, rounds + 1):
+        if rounds > 1:
+            print(f"\n===== 第 {round_index}/{rounds} 轮 =====")
+        current: list[CaseResult] = []
+        for index, case in enumerate(cases, start=1):
+            print(f"[{index}/{len(cases)}] {case['id']} ...", end=" ", flush=True)
+            result = await _run_case(graph, user, case)
+            current.append(result)
+            print("通过" if result.passed else f"未通过（{result.reason}）")
+        round_results.append(current)
+        if rounds > 1:
+            ok = sum(item.passed for item in current)
+            print(f"第 {round_index} 轮：{ok}/{len(current)}（{_percent(ok, len(current))}）")
 
-    report = render_report(results)
+    results = [item for round_items in round_results for item in round_items]
+    report = render_report(results, round_results)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(report, encoding="utf-8")

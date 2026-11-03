@@ -1,5 +1,7 @@
 """限流、登录锁定与并发槽位测试。"""
 
+from types import SimpleNamespace
+
 import pytest
 
 from ecommerce_cs.core import ratelimit
@@ -61,3 +63,49 @@ async def test_ip_lock_after_repeated_failures():
     assert await ratelimit.service.ip_locked_seconds(ip) > 0
     with pytest.raises(RateLimitError):
         await ratelimit.ensure_login_allowed("13800001001", ip)
+
+
+@pytest.mark.asyncio
+async def test_ping_returns_false_when_redis_not_configured(monkeypatch):
+    monkeypatch.setattr(
+        ratelimit,
+        "get_settings",
+        lambda: SimpleNamespace(redis_url="", rate_limit_redis_timeout_seconds=1.0),
+    )
+
+    assert await ratelimit.service.ping() is False
+
+
+@pytest.mark.asyncio
+async def test_ping_returns_true_when_redis_healthy(monkeypatch):
+    class _HealthyRedis:
+        async def ping(self):
+            return True
+
+    monkeypatch.setattr(
+        ratelimit,
+        "get_settings",
+        lambda: SimpleNamespace(redis_url="redis://x", rate_limit_redis_timeout_seconds=1.0),
+    )
+    monkeypatch.setattr(ratelimit.service, "_redis", _HealthyRedis())
+    monkeypatch.setattr(ratelimit.service, "_redis_down_until", 0.0)
+
+    assert await ratelimit.service.ping() is True
+
+
+@pytest.mark.asyncio
+async def test_ping_marks_redis_down_when_ping_raises(monkeypatch):
+    class _BrokenRedis:
+        async def ping(self):
+            raise RuntimeError("down")
+
+    monkeypatch.setattr(
+        ratelimit,
+        "get_settings",
+        lambda: SimpleNamespace(redis_url="redis://x", rate_limit_redis_timeout_seconds=1.0),
+    )
+    monkeypatch.setattr(ratelimit.service, "_redis", _BrokenRedis())
+    monkeypatch.setattr(ratelimit.service, "_redis_down_until", 0.0)
+
+    assert await ratelimit.service.ping() is False
+    assert ratelimit.service._redis_down_until > 0

@@ -97,7 +97,7 @@ async def test_refresh_memory_skips_when_already_running(monkeypatch):
     monkeypatch.setattr(memory_service, "_refresh_memory", fake_refresh)
     lock = asyncio.Lock()
     await lock.acquire()
-    monkeypatch.setitem(memory_service._refresh_locks, "c1", lock)
+    monkeypatch.setitem(memory_service._refresh_locks, "c1", (lock, 0.0))
 
     try:
         await memory_service.refresh_memory("c1", 1)
@@ -125,3 +125,60 @@ async def test_scheduled_refresh_keeps_task_reference(monkeypatch):
     await memory_service.drain_background_tasks(timeout=2)
     await asyncio.sleep(0)
     assert not memory_service._background_tasks
+
+
+def test_refresh_lock_is_reused_within_ttl(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(memory_service.time, "monotonic", lambda: now[0])
+
+    try:
+        first = memory_service.refresh_lock("lock-reuse")
+        now[0] = memory_service._REFRESH_LOCK_TTL_SECONDS - 1
+        assert memory_service.refresh_lock("lock-reuse") is first
+    finally:
+        memory_service._refresh_locks.pop("lock-reuse", None)
+
+
+def test_idle_refresh_lock_is_recycled_after_ttl(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(memory_service.time, "monotonic", lambda: now[0])
+
+    try:
+        first = memory_service.refresh_lock("lock-ttl")
+        now[0] = memory_service._REFRESH_LOCK_TTL_SECONDS + 1
+        assert memory_service.refresh_lock("lock-ttl") is not first
+    finally:
+        memory_service._refresh_locks.pop("lock-ttl", None)
+
+
+@pytest.mark.asyncio
+async def test_prune_keeps_held_refresh_lock():
+    held = asyncio.Lock()
+    await held.acquire()
+    memory_service._refresh_locks["held-lock"] = (held, 0.0)
+    memory_service._refresh_locks["idle-lock"] = (asyncio.Lock(), 0.0)
+
+    try:
+        memory_service._prune_refresh_locks(memory_service._REFRESH_LOCK_TTL_SECONDS + 1)
+        assert "held-lock" in memory_service._refresh_locks
+        assert "idle-lock" not in memory_service._refresh_locks
+    finally:
+        held.release()
+        memory_service._refresh_locks.pop("held-lock", None)
+        memory_service._refresh_locks.pop("idle-lock", None)
+
+
+def test_capacity_limit_prunes_idle_refresh_locks(monkeypatch):
+    monkeypatch.setattr(memory_service, "_MAX_REFRESH_LOCKS", 2)
+    monkeypatch.setattr(memory_service.time, "monotonic", lambda: 700.0)
+    memory_service._refresh_locks["old-a"] = (asyncio.Lock(), 0.0)
+    memory_service._refresh_locks["old-b"] = (asyncio.Lock(), 0.0)
+
+    try:
+        assert memory_service.refresh_lock("new-lock") is not None
+        assert "new-lock" in memory_service._refresh_locks
+        assert "old-a" not in memory_service._refresh_locks
+        assert "old-b" not in memory_service._refresh_locks
+    finally:
+        for key in ("old-a", "old-b", "new-lock"):
+            memory_service._refresh_locks.pop(key, None)

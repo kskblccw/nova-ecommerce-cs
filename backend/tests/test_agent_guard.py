@@ -6,7 +6,9 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
+from ecommerce_cs.agents import graph as graph_module
 from ecommerce_cs.agents.formatting import (
+    MUTATION_CLAIM_RE,
     PENDING_HINT,
     UNSUPPORTED_CLAIM_HINT,
     sanitize_pending_answer,
@@ -122,3 +124,210 @@ def test_postprocess_keeps_status_sentences():
     updates = postprocess_node(state)
 
     assert "messages" not in updates
+
+
+def test_mutation_claim_ignores_process_descriptions():
+    """退款时效这类流程描述不应被当成“助手已执行”的成功声明。"""
+    assert MUTATION_CLAIM_RE.search("退款已提交至支付渠道，1-3 个工作日到账") is None
+    assert MUTATION_CLAIM_RE.search("订单已完成，支持 7 天无理由退货") is None
+
+
+def test_mutation_claim_flags_first_person_or_assistant_subject():
+    assert MUTATION_CLAIM_RE.search("我已提交取消申请") is not None
+    assert MUTATION_CLAIM_RE.search("已为您生成取消申请") is not None
+    assert MUTATION_CLAIM_RE.search("已帮您修改收货地址") is not None
+
+
+def test_pending_answer_keeps_refund_timeline():
+    text = "退款已提交至支付渠道，1-3 个工作日到账。"
+    assert sanitize_pending_answer(text) == text
+
+
+class _FakeCancelTool:
+    def __init__(self, artifact: dict | None = None, error: Exception | None = None):
+        self.artifact = artifact
+        self.error = error
+        self.calls: list[str] = []
+
+    async def coroutine(self, order_no: str):
+        self.calls.append(order_no)
+        if self.error:
+            raise self.error
+        action = {"type": "cancel_order", "summary": "取消订单", "idempotency_key": "k"}
+        artifact = self.artifact or {
+            "kind": "pending_action",
+            "summary": "即将取消订单，请在弹窗中确认。",
+            "data": {"action": action},
+        }
+        return artifact.get("summary", ""), artifact
+
+
+def _state(text: str, *, intent: str = "order") -> dict:
+    return {
+        "intent": intent,
+        "pending_action": None,
+        "messages": [HumanMessage(content=text)],
+    }
+
+
+def _cancel_state(text: str, *, intent: str = "order") -> dict:
+    return _state(text, intent=intent)
+
+
+@pytest.mark.asyncio
+async def test_prefetch_cancel_emits_tool_call_and_pending_artifact(monkeypatch):
+    tool = _FakeCancelTool()
+    monkeypatch.setattr(graph_module, "cancel_order", tool)
+
+    messages = await graph_module._prefetch_cancel_tool(
+        _cancel_state("帮我取消订单 ORD202607160001")
+    )
+
+    assert tool.calls == ["ORD202607160001"]
+    assert len(messages) == 2
+    assert messages[0].tool_calls[0]["name"] == "cancel_order"
+    assert messages[1].artifact["kind"] == "pending_action"
+
+
+@pytest.mark.asyncio
+async def test_prefetch_cancel_skips_questions_and_missing_order_no(monkeypatch):
+    tool = _FakeCancelTool()
+    monkeypatch.setattr(graph_module, "cancel_order", tool)
+
+    assert await graph_module._prefetch_cancel_tool(_cancel_state("如何取消订单？")) == []
+    assert await graph_module._prefetch_cancel_tool(_cancel_state("帮我取消订单")) == []
+    assert await graph_module._prefetch_cancel_tool(
+        _cancel_state("帮我取消订单 ORD202607160001", intent="faq")
+    ) == []
+    assert tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_cancel_ignores_non_pending_tool_result(monkeypatch):
+    tool = _FakeCancelTool(
+        artifact={
+            "kind": "error",
+            "summary": "订单已发货，无法取消。",
+            "data": {"code": "invalid_status"},
+        }
+    )
+    monkeypatch.setattr(graph_module, "cancel_order", tool)
+
+    assert await graph_module._prefetch_cancel_tool(
+        _cancel_state("帮我取消订单 ORD202607160001")
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_cancel_swallows_tool_errors(monkeypatch):
+    tool = _FakeCancelTool(error=RuntimeError("db down"))
+    monkeypatch.setattr(graph_module, "cancel_order", tool)
+
+    assert await graph_module._prefetch_cancel_tool(
+        _cancel_state("帮我取消订单 ORD202607160001")
+    ) == []
+
+
+class _FakeSearchTool:
+    def __init__(self, products):
+        self.products = products
+        self.keywords: list[str] = []
+
+    async def coroutine(self, keyword: str):
+        self.keywords.append(keyword)
+        return (
+            f"搜索 {keyword}",
+            {"kind": "products", "data": {"products": self.products.get(keyword, [])}},
+        )
+
+
+class _FakeCompareTool:
+    def __init__(self, artifact: dict | None = None, error: Exception | None = None):
+        self.artifact = artifact
+        self.error = error
+        self.calls: list[list[int]] = []
+
+    async def coroutine(self, product_ids: list[int]):
+        self.calls.append(list(product_ids))
+        if self.error:
+            raise self.error
+        artifact = self.artifact or {
+            "kind": "comparison",
+            "summary": "商品对比",
+            "data": {"products": []},
+        }
+        return artifact.get("summary", ""), artifact
+
+
+def test_compare_candidates_strips_noise_and_splits_names():
+    names = graph_module._compare_candidates("iPhone 15 Pro Max 和小米14 Ultra 对比一下")
+    assert names == ["iPhone 15 Pro Max", "小米14 Ultra"]
+
+
+@pytest.mark.asyncio
+async def test_prefetch_compare_resolves_products_and_emits_tool_call(monkeypatch):
+    search = _FakeSearchTool(
+        {
+            "iPhone 15 Pro Max": [{"id": 1, "name": "iPhone 15 Pro Max"}],
+            "小米14 Ultra": [{"id": 2, "name": "小米14 Ultra"}],
+        }
+    )
+    compare = _FakeCompareTool()
+    monkeypatch.setattr(graph_module, "search_products", search)
+    monkeypatch.setattr(graph_module, "compare_products", compare)
+
+    messages = await graph_module._prefetch_compare_tool(
+        _state("iPhone 15 Pro Max 和小米14 Ultra 对比一下", intent="product")
+    )
+
+    assert search.keywords == ["iPhone 15 Pro Max", "小米14 Ultra"]
+    assert compare.calls == [[1, 2]]
+    assert len(messages) == 2
+    assert messages[0].tool_calls[0]["name"] == "compare_products"
+    assert messages[0].tool_calls[0]["args"] == {"product_ids": [1, 2]}
+
+
+@pytest.mark.asyncio
+async def test_prefetch_compare_skips_non_compare_queries(monkeypatch):
+    search = _FakeSearchTool({})
+    compare = _FakeCompareTool()
+    monkeypatch.setattr(graph_module, "search_products", search)
+    monkeypatch.setattr(graph_module, "compare_products", compare)
+
+    assert await graph_module._prefetch_compare_tool(
+        _state("推荐一款降噪耳机", intent="product")
+    ) == []
+    assert search.keywords == []
+    assert compare.calls == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_compare_skips_when_products_cannot_be_resolved(monkeypatch):
+    search = _FakeSearchTool({"iPhone 15 Pro Max": [{"id": 1, "name": "iPhone 15 Pro Max"}]})
+    compare = _FakeCompareTool()
+    monkeypatch.setattr(graph_module, "search_products", search)
+    monkeypatch.setattr(graph_module, "compare_products", compare)
+
+    assert await graph_module._prefetch_compare_tool(
+        _state("iPhone 15 Pro Max 和小米14 Ultra 对比一下", intent="product")
+    ) == []
+    assert compare.calls == []
+
+
+@pytest.mark.asyncio
+async def test_prefetch_compare_ignores_non_comparison_result(monkeypatch):
+    search = _FakeSearchTool(
+        {
+            "iPhone 15 Pro Max": [{"id": 1, "name": "iPhone 15 Pro Max"}],
+            "小米14 Ultra": [{"id": 2, "name": "小米14 Ultra"}],
+        }
+    )
+    compare = _FakeCompareTool(
+        artifact={"kind": "error", "summary": "有效商品不足 2 个", "data": {}}
+    )
+    monkeypatch.setattr(graph_module, "search_products", search)
+    monkeypatch.setattr(graph_module, "compare_products", compare)
+
+    assert await graph_module._prefetch_compare_tool(
+        _state("iPhone 15 Pro Max 和小米14 Ultra 对比一下", intent="product")
+    ) == []
