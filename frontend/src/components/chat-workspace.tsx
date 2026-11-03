@@ -168,6 +168,26 @@ export function ChatWorkspace({ initialId }: { initialId?: string }) {
     }
   }, [activeId, hasOlder, loadingOlder, messages]);
 
+  async function recoverAfterDrop(conversationId: string) {
+    try {
+      const [page, pendingData] = await Promise.all([
+        api.listMessages(conversationId, { limit: 30 }),
+        api.pending(conversationId).catch(() => null),
+      ]);
+      setMessages((prev) => {
+        const optimistic = prev.filter((item) => item.id.startsWith("temp-"));
+        const persistedIds = new Set(page.items.map((item) => item.id));
+        return [...page.items, ...optimistic.filter((item) => !persistedIds.has(item.id))];
+      });
+      setHasOlder(page.has_more);
+      setPending(pendingData?.has_pending ? pendingData : null);
+      const last = page.items[page.items.length - 1];
+      return Boolean(last && last.role === "assistant" && last.content.trim());
+    } catch {
+      return false;
+    }
+  }
+
   async function send(textOverride?: string, isRetry = false) {
     const text = (textOverride ?? input).trim();
     if (!text || busy) return;
@@ -217,6 +237,7 @@ export function ChatWorkspace({ initialId }: { initialId?: string }) {
     abortRef.current = controller;
 
     let buffer = "";
+    let recoveredDrop = false;
     try {
       await streamChat(conversationId, text, {
         signal: controller.signal,
@@ -280,14 +301,22 @@ export function ChatWorkspace({ initialId }: { initialId?: string }) {
         setError("已停止生成，可重试");
         setCanRetry(true);
       } else {
-        setError(err instanceof Error ? err.message : "对话失败，请稍后重试");
-        setCanRetry(true);
+        recoveredDrop = await recoverAfterDrop(conversationId);
+        if (recoveredDrop) {
+          setStatus("已恢复服务端保存的回答");
+          setError("网络连接中断，已恢复服务端保存的回答");
+          setCanRetry(false);
+          void refreshConversations();
+        } else {
+          setError(err instanceof Error ? err.message : "对话失败，请稍后重试");
+          setCanRetry(true);
+        }
       }
       setStreamingText("");
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
       setBusy(false);
-      setStatus(null);
+      if (!recoveredDrop) setStatus(null);
     }
   }
 
