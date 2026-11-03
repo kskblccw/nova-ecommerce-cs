@@ -46,7 +46,7 @@ jobs:
       - name: Migration
         run: alembic upgrade head
       - name: Tests
-        run: pytest -q --cov=src --cov-report=term-missing
+        run: pytest -q --cov=src --cov-report=term-missing --cov-fail-under=65
 
   frontend:
     runs-on: ubuntu-latest
@@ -64,3 +64,5 @@ jobs:
         run: npm ci
       - name: Typecheck
         run: npm run typecheck
+      - name: Test
+        run: npm test

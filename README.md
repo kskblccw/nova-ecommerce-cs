@@ -3,12 +3,19 @@
 [![CI](https://github.com/kskblccw/nova-ecommerce-cs/actions/workflows/ci.yml/badge.svg)](https://github.com/kskblccw/nova-ecommerce-cs/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Tests](https://img.shields.io/badge/tests-86%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-199%20passed-brightgreen)
 
 企业级多智能体电商客服系统：FastAPI + LangGraph 后端，Next.js 前端，
 覆盖订单、物流、售后、商品导购、FAQ 与知识库检索。
 
 > 架构与设计决策见 [docs/架构设计.md](docs/架构设计.md)。
+
+## 在线演示
+
+[打开交互演示 →](https://kskblccw.github.io/nova-ecommerce-cs/)
+
+预置对话回放，展示确定性路由、工具调用、审批弹窗与回答链路；不连接线上数据库或大模型。
+完整运行请使用下方 Docker 或本地启动方式。
 
 ## 技术栈
 
@@ -76,19 +83,19 @@
 > [RAG 压测报告](docs/RAG压测报告.md)。当前语料下向量单路已很强，RRF 主要作为
 > 关键词降级与鲁棒性兜底；当知识库变为型号/专有名词密集型语料时应重新评测调权。
 
-回答级端到端评测（`backend/benchmarks/golden_qa.jsonl`，25 条，覆盖订单、售后、商品、FAQ、转人工与注入防护）：
+回答级端到端评测（`backend/benchmarks/golden_qa.jsonl`，25 条 × 3 轮，覆盖订单、售后、商品、FAQ、转人工与注入防护）：
 
 | 指标 | 结果 |
 |---|---:|
-| 端到端通过率 | 23/25（92.0%） |
-| 路由准确率 | 24/24（100%） |
-| 工具调用匹配率 | 20/21（95.2%） |
-| 事实要点覆盖率 | 19/20（95.0%） |
-| 审批触发正确率 | 23/24（95.8%） |
+| 端到端通过率 | 75/75（100.0%） |
+| 路由准确率 | 72/72（100.0%） |
+| 工具调用匹配率 | 63/63（100.0%） |
+| 事实要点覆盖率 | 60/60（100.0%） |
+| 审批触发正确率 | 72/72（100.0%） |
 | 越权/敏感表述 | 0 处 |
 
-> 逐条明细与失败原因见 [回答质量评测报告](docs/回答质量评测报告.md)。2 条未通过分别是：
-> 用户要求跳过确认时的安全拒答（未生成待确认操作）、一次回答净化误伤（把政策回答替换成确认提示）。
+> 逐条明细、轮间稳定性与失败原因见 [回答质量评测报告](docs/回答质量评测报告.md)。
+> 25 个用例全部 3/3 通过；平均 4.1s、P95 9.1s。
 
 ## 目录
 
@@ -299,11 +306,12 @@ mypy src                       # 类型检查
 
 cd ../frontend
 npm run typecheck
+npm test                       # SSE 解析与流式请求单测
 npm run build
 ```
 
 CI 在 `.github/workflows/ci.yml`：PostgreSQL 服务 + Alembic 迁移 + ruff + mypy +
-单元/集成测试（附带覆盖率输出）+ 前端 typecheck。
+单元/集成测试（附带覆盖率门槛）+ 前端 typecheck + 前端单测。
 
 RAG 评测与压测：
 
@@ -318,7 +326,7 @@ python benchmarks/bench_retrieval.py --requests 300 --concurrency 8
 
 - **会话串行锁是进程内锁**：单实例部署可靠；多 worker / 多实例部署时需要替换为 Redis 分布式锁。
 - **依赖锁定到直接依赖**：传递依赖仍由 pip 解析；需要完全可复现时可再引入 lock 文件。
-- **前端暂无自动化测试**：以 `tsc --noEmit` 与手工回归为主。
+- **前端测试聚焦纯逻辑**：已覆盖 SSE 解析与流式请求，组件交互仍以手工回归为主。
 - **评测语料为演示数据**：246 个知识切片、55 条检索问法、25 条回答用例，不代表线上规模。
 
 ## Docker
@@ -332,9 +340,12 @@ docker compose up --build
 - PostgreSQL（`pgvector/pgvector:pg16`，自带 vector 扩展）：localhost:5432
 - Redis：localhost:6379
 
-首次启动后执行：
+容器启动时会自动执行 `alembic upgrade head` 和幂等 seed（已有用户数据时自动跳过），
+首次 `docker compose up --build` 即可直接使用。
+
+如需重置演示数据，或关闭自动 seed：
 
 ```bash
-docker compose exec api alembic upgrade head
 docker compose exec api python -m ecommerce_cs.seed_data --reset --with-index
+SEED_ON_START=false docker compose up --build
 ```
