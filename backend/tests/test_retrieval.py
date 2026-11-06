@@ -5,10 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from ecommerce_cs.db.models import RagChunk
 from ecommerce_cs.rag import retriever as retriever_module
+from ecommerce_cs.rag.milvus_store import VectorHit
 from ecommerce_cs.rag.retriever import (
     KnowledgeHit,
     _keyword_score,
+    _milvus_search,
     _numpy_search,
     _pgvector_search,
     _vector_search,
@@ -370,3 +373,106 @@ async def test_search_swallows_recall_failures(monkeypatch):
     monkeypatch.setattr(retriever_module.knowledge_repo, "log_retrieval", fake_log)
 
     assert await search(_FakeDB(), "退款", with_log=False) == []
+
+
+@pytest.mark.asyncio
+async def test_milvus_search_reads_content_from_postgres(monkeypatch):
+    chunks = [
+        SimpleNamespace(id="c1", document_id="d1", content="片段 A"),
+        SimpleNamespace(id="c2", document_id="d2", content="片段 B"),
+    ]
+    documents = [_document("d1", "文档一", "内容一"), _document("d2", "文档二", "内容二")]
+
+    class _EntityDB(_FakeDB):
+        async def scalars(self, stmt):
+            if stmt.column_descriptions[0].get("entity") is RagChunk:
+                return _Rows(chunks)
+            return _Rows(documents)
+
+    monkeypatch.setattr(
+        retriever_module,
+        "get_embeddings",
+        lambda: _FakeEmbeddings(vector=[1.0, 0.0]),
+    )
+    monkeypatch.setattr(
+        retriever_module.milvus_store,
+        "search",
+        lambda _vector, _limit: [
+            VectorHit("c1", "d1", 0, 0.91),
+            VectorHit("c2", "d2", 0, 0.52),
+        ],
+    )
+
+    hits = await _milvus_search(_EntityDB(), "测试", limit=2)
+
+    assert [hit.document_id for hit in hits] == ["d1", "d2"]
+    assert hits[0].content == "片段 A"
+    assert hits[0].score == 0.91
+    assert hits[0].sources == ("vector",)
+
+
+@pytest.mark.asyncio
+async def test_milvus_search_returns_empty_when_embedding_fails(monkeypatch):
+    monkeypatch.setattr(
+        retriever_module,
+        "get_embeddings",
+        lambda: _FakeEmbeddings(error=RuntimeError("model down")),
+    )
+    assert await _milvus_search(_FakeDB(), "测试", limit=2) == []
+
+
+@pytest.mark.asyncio
+async def test_vector_search_prefers_milvus(monkeypatch):
+    monkeypatch.setattr(
+        retriever_module,
+        "get_settings",
+        lambda: SimpleNamespace(rag_vector_backend="milvus"),
+    )
+    monkeypatch.setattr(
+        retriever_module.milvus_store,
+        "get_settings",
+        lambda: SimpleNamespace(rag_vector_backend="milvus"),
+    )
+    monkeypatch.setattr(retriever_module.milvus_store, "_available", True)
+
+    async def fake_milvus(_db, _query, _limit):
+        return [_hit("milvus", "vector")]
+
+    async def fake_numpy(_db, _query, _limit):
+        return [_hit("numpy", "vector")]
+
+    monkeypatch.setattr(retriever_module, "_milvus_search", fake_milvus)
+    monkeypatch.setattr(retriever_module, "_numpy_search", fake_numpy)
+
+    hits = await _vector_search(_FakeDB(), "测试", 3)
+
+    assert [hit.document_id for hit in hits] == ["milvus"]
+
+
+@pytest.mark.asyncio
+async def test_vector_search_falls_back_to_numpy_when_milvus_fails(monkeypatch):
+    monkeypatch.setattr(
+        retriever_module,
+        "get_settings",
+        lambda: SimpleNamespace(rag_vector_backend="milvus"),
+    )
+    monkeypatch.setattr(
+        retriever_module.milvus_store,
+        "get_settings",
+        lambda: SimpleNamespace(rag_vector_backend="milvus"),
+    )
+    monkeypatch.setattr(retriever_module.milvus_store, "_available", True)
+
+    async def broken_milvus(_db, _query, _limit):
+        raise RuntimeError("milvus broken")
+
+    async def fake_numpy(_db, _query, _limit):
+        return [_hit("numpy", "vector")]
+
+    monkeypatch.setattr(retriever_module, "_milvus_search", broken_milvus)
+    monkeypatch.setattr(retriever_module, "_numpy_search", fake_numpy)
+
+    hits = await _vector_search(_FakeDB(), "测试", 3)
+
+    assert [hit.document_id for hit in hits] == ["numpy"]
+    assert retriever_module.milvus_store.available() is False

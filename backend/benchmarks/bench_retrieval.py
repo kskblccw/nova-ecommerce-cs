@@ -24,7 +24,7 @@ from sqlalchemy import text  # noqa: E402
 
 from ecommerce_cs.db.session import SessionLocal  # noqa: E402
 from ecommerce_cs.llm.factory import get_embeddings  # noqa: E402
-from ecommerce_cs.rag import retriever  # noqa: E402
+from ecommerce_cs.rag import milvus_store, retriever  # noqa: E402
 
 QUERY_FILE = Path(__file__).with_name("retrieval_queries.jsonl")
 
@@ -76,7 +76,12 @@ async def backend_info() -> tuple[str, int]:
             await db.rollback()
             count = 0
         chunks = int((await db.execute(text("SELECT count(*) FROM rag_chunks"))).scalar() or 0)
-    label = "pgvector + HNSW" if available else "JSONB + numpy 余弦"
+    milvus = milvus_store.available()
+    if milvus:
+        label = "Milvus Lite"
+        count = milvus_store.count()
+    else:
+        label = "pgvector + HNSW" if available else "JSONB + numpy 余弦"
     return f"{label}（配置 {mode}，向量 {count}/{chunks}）", chunks
 
 

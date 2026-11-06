@@ -4,6 +4,15 @@ import pytest
 from sqlalchemy import text
 
 from ecommerce_cs.db.session import SessionLocal, engine
+from ecommerce_cs.rag import milvus_store
+
+
+@pytest.fixture(autouse=True)
+def _disable_milvus():
+    """集成测试按真实配置连接 Milvus，覆盖父级 conftest 的强制关闭。"""
+    milvus_store.reset()
+    yield
+    milvus_store.reset()
 
 
 @pytest.fixture(autouse=True)

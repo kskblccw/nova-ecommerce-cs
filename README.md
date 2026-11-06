@@ -3,7 +3,7 @@
 [![CI](https://github.com/kskblccw/nova-ecommerce-cs/actions/workflows/ci.yml/badge.svg)](https://github.com/kskblccw/nova-ecommerce-cs/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Tests](https://img.shields.io/badge/tests-199%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-200%20passed-brightgreen)
 
 企业级多智能体电商客服系统：FastAPI + LangGraph 后端，Next.js 前端，
 覆盖订单、物流、售后、商品导购、FAQ 与知识库检索。
@@ -23,7 +23,7 @@
 |---|---|
 | 后端 | Python 3.12、FastAPI、LangGraph 1.x、LangChain、SQLAlchemy 2 async、Alembic |
 | 前端 | Next.js 15 App Router、React 19、TypeScript、Tailwind CSS |
-| 数据库 | PostgreSQL 16/18（业务数据 + LangGraph checkpoint），pgvector HNSW 向量索引（可选降级） |
+| 数据库 | PostgreSQL 16/18（业务数据 + LangGraph checkpoint）；Milvus Lite 向量索引（pgvector HNSW / JSONB+numpy 依次降级） |
 | 限流 | Redis 滑动窗口（不可用时自动降级为进程内计数） |
 | LLM | 阿里云 DashScope（qwen-plus）+ text-embedding-v3 |
 | 可观测性 | structlog 结构化日志 + Prometheus 指标 + LangSmith 全链路追踪（可选） |
@@ -37,7 +37,7 @@
 - **结构化结果**：订单卡、物流时间线、商品卡、对比表、售后进度、FAQ 命中，前端按类型渲染
 - **审批闭环**：变更类工具只产出 `PendingAction`，确认后才写库，`idempotency_key` 保证幂等
 - **记忆系统**：会话摘要 + 用户画像，按 token 预算注入；后台异步压缩
-- **知识库后台**：文档 CRUD、双路召回（pgvector HNSW / JSONB 向量 + 关键词加权 RRF）、命中统计、一键重建索引、审计日志
+- **知识库后台**：文档 CRUD、双路召回（Milvus Lite 向量 + 中文 bigram 关键词，加权 RRF 融合；pgvector / numpy 自动降级）、命中统计、一键重建索引、审计日志
 - **稳定性**：登录锁定/接口限流、LLM 熔断与降级回复、工具调用上限与超时、SSE 心跳、reset 撤回工具前旁白
 - **一致性**：待确认操作期间禁止新消息；同一会话生成/审批串行化；客户端消息 ID 幂等，重试不重复落库
 - **消息历史**：游标分页（`limit` + `before`），前端上滑加载更早消息
@@ -76,8 +76,13 @@
 
 | 向量实现 | QPS | P50 | P95 |
 |---|---:|---:|---:|
-| JSONB + numpy 全表余弦 | 7.5 | 902ms | 1038ms |
-| pgvector + HNSW | 133.4 | 44ms | 62ms |
+| JSONB + numpy 全表余弦 | 8.0 | 837ms | 971ms |
+| **Milvus Lite（当前默认）** | **45.3** | **142ms** | **166ms** |
+| pgvector + HNSW（可选后端） | 133.4 | 44ms | 62ms |
+
+> Milvus Lite 走进程内 gRPC，小语料下不如 pgvector 快；选择它是因为向量库可独立演进
+> （`MILVUS_DB_URI` 换成 `http://host:19530` 即可切到独立 Milvus 集群），且对检索质量无影响
+> （Recall@4 保持 98.2%）。pgvector 仍保留为降级后端。
 
 > 详细口径、逐条明细与复现命令见 [RAG 评测报告](docs/RAG评测报告.md) 与
 > [RAG 压测报告](docs/RAG压测报告.md)。当前语料下向量单路已很强，RRF 主要作为
@@ -179,9 +184,11 @@ python -m ecommerce_cs.seed_data --reset
 python -m ecommerce_cs.rag.indexer
 ```
 
-> 迁移 `0003` 会自动检测 pgvector：扩展可用时创建 `embedding_vec vector(1024)` 与
-> HNSW 索引；Windows 本地未安装扩展时自动跳过，检索继续使用 JSONB + numpy 降级路径。
-> 启用 pgvector 后需执行一次 `python -m ecommerce_cs.rag.indexer` 回填向量。
+> 向量主路径是 Milvus Lite：`MILVUS_DB_URI` 指向本地文件时进程内嵌运行，数据落在
+> `backend/data/milvus.db`；设为 `http://host:19530` 则连接独立 Milvus 集群。
+> 迁移 `0003` 仍会检测 pgvector：扩展可用时创建 `embedding_vec vector(1024)` 与
+> HNSW 索引，作为 Milvus 不可用时的降级后端；Windows 本地未安装扩展时跳过，
+> 检索继续使用 JSONB + numpy 降级路径。
 
 > 若要一步完成：`python -m ecommerce_cs.seed_data --reset --with-index`
 
@@ -325,6 +332,8 @@ python benchmarks/bench_retrieval.py --requests 300 --concurrency 8
 ## 已知限制
 
 - **会话串行锁是进程内锁**：单实例部署可靠；多 worker / 多实例部署时需要替换为 Redis 分布式锁。
+- **Milvus Lite 是进程内嵌、单进程文件锁**：同一数据文件不能被多个 worker 共享；多副本部署需把
+  `MILVUS_DB_URI` 指向独立 Milvus 集群，或切回 pgvector 后端。
 - **依赖锁定到直接依赖**：传递依赖仍由 pip 解析；需要完全可复现时可再引入 lock 文件。
 - **前端测试聚焦纯逻辑**：已覆盖 SSE 解析与流式请求，组件交互仍以手工回归为主。
 - **评测语料为演示数据**：246 个知识切片、55 条检索问法、25 条回答用例，不代表线上规模。
@@ -338,6 +347,7 @@ docker compose up --build
 - 前端：http://localhost:3000
 - 后端：http://localhost:8000
 - PostgreSQL（`pgvector/pgvector:pg16`，自带 vector 扩展）：localhost:5432
+- Milvus Lite：跑在 api 容器内，数据持久化到 `milvusdata` 卷（`/app/data/milvus.db`）
 - Redis：localhost:6379
 
 容器启动时会自动执行 `alembic upgrade head` 和幂等 seed（已有用户数据时自动跳过），

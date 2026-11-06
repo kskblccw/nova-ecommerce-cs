@@ -32,6 +32,7 @@ from sqlalchemy import func, select  # noqa: E402
 from ecommerce_cs.core.settings import get_settings  # noqa: E402
 from ecommerce_cs.db.models import RagChunk, RagDocument  # noqa: E402
 from ecommerce_cs.db.session import SessionLocal  # noqa: E402
+from ecommerce_cs.rag import milvus_store  # noqa: E402
 from ecommerce_cs.rag.retriever import (  # noqa: E402
     KnowledgeHit,
     _keyword_search,
@@ -93,7 +94,9 @@ async def evaluate(limit: int) -> tuple[list[QueryResult], dict]:
         total_docs = int(await db.scalar(select(func.count(RagDocument.id))) or 0)
         total_chunks = int(await db.scalar(select(func.count(RagChunk.id))) or 0)
         vector_backend = (
-            "pgvector + HNSW" if await pgvector_available(db) else "JSONB + numpy 余弦"
+            "Milvus Lite"
+            if milvus_store.available()
+            else ("pgvector + HNSW" if await pgvector_available(db) else "JSONB + numpy 余弦")
         )
 
         for item in queries:
