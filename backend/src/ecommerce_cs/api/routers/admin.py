@@ -10,6 +10,7 @@ from ecommerce_cs.db.models import User
 from ecommerce_cs.db.repositories import knowledge as knowledge_repo
 from ecommerce_cs.db.repositories import ops as ops_repo
 from ecommerce_cs.db.session import get_db
+from ecommerce_cs.rag import milvus_store
 from ecommerce_cs.rag.indexer import SYSTEM_SOURCES, index_single_document, rebuild_index
 from ecommerce_cs.rag.retriever import search
 from ecommerce_cs.schemas.knowledge import (
@@ -141,6 +142,7 @@ async def delete_document(
         raise NotFoundError("文档不存在")
     _ensure_editable(document)
     await knowledge_repo.delete_documents(db, [document_id])
+    milvus_store.delete_documents([document_id])
     await ops_repo.audit(
         db,
         user_id=admin.id,
@@ -160,6 +162,7 @@ async def batch_delete(
     id_list = [item.strip() for item in ids.split(",") if item.strip()]
     await _ensure_ids_editable(db, id_list)
     deleted = await knowledge_repo.delete_documents(db, id_list)
+    milvus_store.delete_documents(id_list)
     await ops_repo.audit(
         db,
         user_id=admin.id,

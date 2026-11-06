@@ -19,5 +19,7 @@ bcrypt==5.0.0
 python-dotenv==1.2.4
 structlog==26.1.0
 numpy==2.5.4
+pymilvus==2.6.9
+milvus-lite==3.2.2
 psycopg[binary,pool]==3.3.6
 redis==8.1.0

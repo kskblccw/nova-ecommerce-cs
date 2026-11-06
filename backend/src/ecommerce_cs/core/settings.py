@@ -74,7 +74,10 @@ class Settings(BaseSettings):
     trust_forwarded_for: bool = False  # 仅当部署在可信反向代理后时开启
 
     # ── RAG 双路召回 ──────────────────────────────────────────────────────────
-    rag_vector_backend: str = "auto"  # auto / pgvector / numpy
+    rag_vector_backend: str = "auto"  # auto / milvus / pgvector / numpy
+    # 不能叫 MILVUS_URI：pymilvus 会把它当成服务地址，本地文件路径会导致导入失败
+    milvus_db_uri: str = str(BASE_DIR / "data" / "milvus.db")  # 本地文件=Milvus Lite
+    milvus_collection: str = "rag_chunks"
     rag_vector_candidates: int = 12
     rag_keyword_candidates: int = 12
     rag_rrf_k: int = 10

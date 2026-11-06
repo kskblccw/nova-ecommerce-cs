@@ -1,6 +1,6 @@
 """双路召回 + RRF 融合检索。
 
-路径一：向量召回（JSONB 中的 embedding + 余弦相似度）。
+路径一：向量召回（Milvus Lite 为主，pgvector / JSONB + numpy 依次降级）。
 路径二：关键词召回（中文 bigram + 标题加权，直接走 SQL ILIKE）。
 最后用 Reciprocal Rank Fusion 合并两路排名，避免单一召回策略的偏好。
 """
@@ -16,9 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ecommerce_cs.core.logging import get_logger
 from ecommerce_cs.core.settings import get_settings
-from ecommerce_cs.db.models import RagDocument
+from ecommerce_cs.db.models import RagChunk, RagDocument
 from ecommerce_cs.db.repositories import knowledge as knowledge_repo
 from ecommerce_cs.llm.factory import get_embeddings
+from ecommerce_cs.rag import milvus_store
 
 log = get_logger("retriever")
 
@@ -205,6 +206,61 @@ async def pgvector_available(db: AsyncSession) -> bool:
     return _VECTOR_CAPABILITY
 
 
+async def _milvus_search(db: AsyncSession, query: str, limit: int) -> list[KnowledgeHit]:
+    """Milvus 召回 chunk 后按主键回查正文，正文始终以 Postgres 为准。"""
+    try:
+        query_vector = await get_embeddings().embed_query(query)
+    except Exception:
+        log.exception("embedding_query_failed_fallback_keyword")
+        return []
+    if not query_vector:
+        return []
+
+    chunk_hits = milvus_store.search(query_vector, limit * 2)
+    if not chunk_hits:
+        return []
+
+    chunk_ids = [item.chunk_id for item in chunk_hits]
+    chunk_rows = {
+        chunk.id: chunk
+        for chunk in (
+            await db.scalars(select(RagChunk).where(RagChunk.id.in_(chunk_ids)))
+        ).all()
+    }
+    document_ids = {chunk.document_id for chunk in chunk_rows.values()}
+    documents = {
+        document.id: document
+        for document in (
+            await db.scalars(select(RagDocument).where(RagDocument.id.in_(document_ids)))
+        ).all()
+    }
+
+    hits: list[KnowledgeHit] = []
+    seen_documents: set[str] = set()
+    for item in chunk_hits:
+        chunk = chunk_rows.get(item.chunk_id)
+        if chunk is None or chunk.document_id in seen_documents:
+            continue
+        document = documents.get(chunk.document_id)
+        if not document:
+            continue
+        seen_documents.add(chunk.document_id)
+        hits.append(
+            KnowledgeHit(
+                document_id=document.id,
+                title=document.title,
+                doc_type=document.doc_type,
+                category=document.category,
+                content=chunk.content,
+                score=item.score,
+                sources=("vector",),
+            )
+        )
+        if len(hits) >= limit:
+            break
+    return hits
+
+
 async def _pgvector_search(
     db: AsyncSession, query: str, limit: int
 ) -> list[KnowledgeHit]:
@@ -324,6 +380,20 @@ async def _vector_search(
     db: AsyncSession, query: str, limit: int
 ) -> list[KnowledgeHit]:
     global _VECTOR_CAPABILITY
+
+    mode = get_settings().rag_vector_backend.strip().lower()
+    if mode in ("auto", "milvus") and milvus_store.available():
+        try:
+            hits = await _milvus_search(db, query, limit)
+            if hits:
+                return hits
+        except Exception:
+            log.exception("milvus_search_failed_fallback")
+            milvus_store.mark_unavailable()
+
+    if mode == "milvus":
+        return await _numpy_search(db, query, limit)
+
     if await pgvector_available(db):
         try:
             hits = await _pgvector_search(db, query, limit)

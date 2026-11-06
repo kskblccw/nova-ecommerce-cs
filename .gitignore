@@ -23,6 +23,8 @@ out/
 *.coverage
 .coverage
 htmlcov/
+# Milvus Lite 本地数据文件
+backend/data/
 .DS_Store
 Thumbs.db
 .idea/

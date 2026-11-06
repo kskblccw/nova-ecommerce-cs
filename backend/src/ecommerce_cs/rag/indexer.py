@@ -10,6 +10,7 @@ from ecommerce_cs.core.logging import get_logger
 from ecommerce_cs.db.models import FAQ, Product, RagChunk, RagDocument
 from ecommerce_cs.db.session import SessionLocal
 from ecommerce_cs.llm.factory import get_embeddings
+from ecommerce_cs.rag import milvus_store
 from ecommerce_cs.rag.chunking import split_text
 from ecommerce_cs.rag.content import AFTERSALE_POLICY, CATEGORY_GUIDES, PRODUCT_TEMPLATES
 from ecommerce_cs.rag.retriever import pgvector_available, vector_literal
@@ -100,16 +101,29 @@ async def _build_system_documents(db: AsyncSession) -> list[RagDocument]:
 async def _write_vectors(
     db: AsyncSession, chunks: list[tuple[RagChunk, list[float]]]
 ) -> None:
-    """pgvector 可用时把向量写入 embedding_vec；失败只降级，不阻塞写入。"""
+    """先写 Milvus 向量索引，再兼容写 pgvector；两者失败都只降级不阻塞。"""
+    vectors = [(chunk, vector) for chunk, vector in chunks if vector]
+    if not vectors:
+        return
+
+    milvus_store.upsert_chunks(
+        [
+            milvus_store.ChunkVector(
+                chunk_id=str(chunk.id),
+                document_id=str(getattr(chunk, "document_id", "")),
+                chunk_index=int(getattr(chunk, "chunk_index", 0) or 0),
+                embedding=vector,
+            )
+            for chunk, vector in vectors
+        ]
+    )
+
     if not await pgvector_available(db):
         return
     rows = [
         {"id": chunk.id, "vec": vector_literal(vector)}
-        for chunk, vector in chunks
-        if vector
+        for chunk, vector in vectors
     ]
-    if not rows:
-        return
     try:
         await db.execute(
             text(
@@ -180,6 +194,7 @@ async def rebuild_index(db: AsyncSession) -> dict[str, int]:
         await db.execute(delete(RagChunk).where(RagChunk.document_id.in_(stale_ids)))
         await db.execute(delete(RagDocument).where(RagDocument.id.in_(stale_ids)))
         await db.commit()
+        milvus_store.delete_documents(stale_ids)
 
     for document in documents:
         current = existing_map.get(document.id)
@@ -196,6 +211,7 @@ async def rebuild_index(db: AsyncSession) -> dict[str, int]:
 
     await db.execute(delete(RagChunk).where(RagChunk.document_id.in_(new_ids)))
     await db.commit()
+    milvus_store.delete_documents(list(new_ids))
 
     chunks = await _index_documents(db, documents)
     return {"documents": len(documents), "chunks": chunks}
@@ -204,6 +220,7 @@ async def rebuild_index(db: AsyncSession) -> dict[str, int]:
 async def index_single_document(db: AsyncSession, document: RagDocument) -> int:
     await db.execute(delete(RagChunk).where(RagChunk.document_id == document.id))
     await db.commit()
+    milvus_store.delete_documents([document.id])
     return await _index_documents(db, [document])
 
 
